@@ -315,6 +315,20 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # fence how a command SPELLS this path, and the kernel denial is what still
     # holds when a spelling is built at runtime (``$(printf ...)``).
     "settings_seeds.json",
+    # The fork-lineage / model-state sidecar (agent_state.py). Same
+    # input-to-an-authorization-decision class as the ceilings above:
+    # ``forked_from`` / ``private_to`` decide whether the fork endpoint treats
+    # a template as one crew's private copy, so a forged entry makes the
+    # owner's next PATCH mutate a SHARED template. The tool gate and the bash
+    # text matcher fence the spelled paths, but a spawned interpreter's
+    # ``open()`` or a split-string shell path reaches the file by constructed
+    # runtime paths no text gate can see — only an OS disposition closes that.
+    # Read-only, not hidden: in-sandbox readers (a script cron's fork-info
+    # reads) must keep working, and every legitimate WRITER (the dashboard
+    # fork/publish/reset handlers, the CLI) runs in the unsandboxed gateway or
+    # user process. The seatbelt denies by literal path, so the seal holds for
+    # an initially-ABSENT sidecar too (creation at that path is a write).
+    "agent_model_state.json",
 )
 
 #: Crew-home leaves that MUST stay read-write for a sandboxed process. Every entry is

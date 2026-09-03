@@ -140,7 +140,11 @@ from kiro_crew.acp.types import (
     JsonRpcRequest,
     model_registry_namespace,
 )
-from kiro_crew.agent import ensure_agent_materialized
+from kiro_crew.agent import (
+    ForkGovernanceUnresolved,
+    ensure_agent_materialized,
+    require_fork_governance,
+)
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config.paths import kiro_sessions_dir
@@ -4462,6 +4466,14 @@ class AcpClient:
                 await asyncio.to_thread(ensure_agent_materialized, self._agent)
             except Exception:
                 logger.warning("pre-spawn agent materialization failed", exc_info=True)
+            # NOT best-effort: a fork-backed agent may not spawn until fork
+            # governance is re-projected, and a failed or timed-out refresh
+            # ABORTS the spawn — its on-disk allowedTools/autoApprove bypass
+            # the PreToolUse gate, so proceeding would run ungoverned grants.
+            try:
+                await asyncio.to_thread(require_fork_governance, self._agent)
+            except ForkGovernanceUnresolved as exc:
+                raise AcpError(str(exc)) from exc
             argv = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
 
         # OS-level sandbox: wrap the command to hide sensitive paths.

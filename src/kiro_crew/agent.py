@@ -23,6 +23,7 @@ Dynamic fields resolved at install time:
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import logging
@@ -33,10 +34,11 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, MutableMapping
+from typing import Any, Iterator, Literal, MutableMapping
 
 from kiro_crew import agent_state, platform_compat
 from kiro_crew.agent_discovery import _read_agent_spec
@@ -202,6 +204,26 @@ def _atomic_json_write(path: Path, data: dict) -> None:
         except OSError:
             pass
         raise
+
+
+@contextlib.contextmanager
+def agents_spec_lock(agents_dir: Path) -> Iterator[None]:
+    """Cross-process advisory lock serializing every template-spec write.
+
+    One lock for the fork/publish endpoints, the agent-detail PATCH, and the
+    background fork refresh: a read-modify-writer that skips it can interleave
+    with any of the others and silently revert their write. Sidecar lockfile
+    (not the spec's own fd) for the same reason update_config_locked uses one:
+    atomic replace swaps the inode, so a lock on the spec fd would not
+    serialize across the rename.
+    """
+    lock_path = agents_dir / ".kirocrew-agents.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with platform_compat.file_lock(fd, exclusive=True, wait=True):
+            yield
+    finally:
+        os.close(fd)
 
 
 # Resolved per call, never captured at import: an import-time binding freezes
@@ -2585,7 +2607,9 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     return config
 
 
-def _refresh_dynamic_fields(config: dict, *, gated_off: "frozenset[str] | None" = None) -> None:
+def _refresh_dynamic_fields(
+    config: dict, *, gated_off: "frozenset[str] | None" = None, fork: bool = False
+) -> None:
     """Update security-critical and dynamic fields in an existing config.
 
     Called when ``kirocrew.json`` already exists so user customizations are
@@ -2595,9 +2619,39 @@ def _refresh_dynamic_fields(config: dict, *, gated_off: "frozenset[str] | None" 
         gated_off: Managed servers whose ``spec_gate`` is closed. Pass the
             caller's snapshot so one rebuild's emit path and its withhold audit
             agree; omitted, it is evaluated here.
+        fork: The config is a crew's private COPY of an owned template
+            (see ``agent_state`` fork lineage). The copy exists precisely so
+            human edits stop landing on the shared file, so three writes that
+            are correct for ``kirocrew.json`` are wrong here and are skipped:
+            the unconditional prompt overwrite (only refreshed while the value
+            is still the machine-shaped ``file://`` pointer), the legacy
+            ``deniedCommands`` strip (on a fork that field IS the user's
+            guardrails, not an old build's injection), and the global
+            ``agent.model`` propagation (a main-agent setting; stamping it on
+            every fork would override the fork's own pin). Everything else —
+            managed MCP commands, security hooks, the data-home pin — applies
+            identically, which is the whole reason forks are refreshed at all.
     """
-    # Prompt URI — always resolve at install time
-    config["prompt"] = f"file://{_prompt_path()}"
+    # Prompt URI — always resolve at install time. On a fork, only while the
+    # value is positively the MANAGED pointer: it already equals the current
+    # machine-shaped URI, or it is a file:// naming the managed prompt FILE at
+    # a stale directory (a dangling pointer left by a moved data home or an
+    # upgraded wheel — the very thing this refresh repairs). Identity comes
+    # from the filename, never from existence: a custom file-backed prompt
+    # that is temporarily unavailable (an unmounted network drive) must not be
+    # misread as dangling and silently replaced — the fork exists to protect
+    # user content, and the original path would be unrecoverable.
+    managed_prompt = _prompt_path()
+    managed_uri = f"file://{managed_prompt}"
+    if not fork:
+        config["prompt"] = managed_uri
+    else:
+        current = str(config.get("prompt") or "")
+        if current.startswith("file://") and (
+            current == managed_uri
+            or Path(current[len("file://") :]).name == managed_prompt.name
+        ):
+            config["prompt"] = managed_uri
 
     # Managed MCP servers — ensure present and up-to-date.
     # Only refresh command/args; preserve user customizations (e.g. autoApprove).
@@ -2693,7 +2747,9 @@ def _refresh_dynamic_fields(config: dict, *, gated_off: "frozenset[str] | None" 
     # Upgrade cleanup: drop the retired deniedCommands/autoAllowReadonly that an
     # older build injected into this existing config, so kiro-cli stops enforcing
     # the stale list ahead of the hooks gate (see _strip_legacy_denied_commands).
-    _strip_legacy_denied_commands(config)
+    # Not on a fork: there the field is the user's own guardrails.
+    if not fork:
+        _strip_legacy_denied_commands(config)
 
     # Merge user-defined kiro_hooks from ~/.kiro/crew/config.json (additive).
     mc_cfg = _load_json(_mc_config_path()) or {}
@@ -2757,7 +2813,7 @@ def _refresh_dynamic_fields(config: dict, *, gated_off: "frozenset[str] | None" 
     # deny_unknown_fields — a spec it rejects wholesale, silently falling back to
     # the default agent.
     mc_model = normalize_agent_model((mc_cfg.get("agent") or {}).get("model"))
-    if mc_model:
+    if mc_model and not fork:
         config["model"] = mc_model
 
     # Ensure kiro-cli uses agent-level mcpServers exclusively (not global
@@ -3940,7 +3996,9 @@ def reproject_for_ceiling_change() -> None:
     _projected_ceiling_generation = generation
 
 
-def rebuild_agent_config(*, clean: bool = False) -> Path:
+def rebuild_agent_config(
+    *, clean: bool = False, refresh_forks: bool | Literal["defer"] = True
+) -> Path:
     """Rebuild and write the merged kirocrew.json to ~/.kiro/agents/.
 
     This is the single authoritative function for producing the agent config.
@@ -4940,10 +4998,266 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     # are also available for the other (agents↔plugins, skills).
     sync_aim_packages()
 
+    # Keep crews' private template copies (forks of owned templates)
+    # machine-maintained — same reason kirocrew.json itself is refreshed.
+    # "defer" is the boot path: per-fork work scales with fork count and must
+    # not delay readiness. Owning the deferral HERE keeps the skip+schedule
+    # pair in one place, so no caller can skip the refresh and forget the
+    # background half (or drop gated_off, as the first split version did).
+    if refresh_forks == "defer":
+        # The whole refresh — plumbing AND the governance projection — stays
+        # off the boot path (no-new-work-on-gateway-boot-path: the per-fork
+        # pass scales with fork count). Sessions do not get to race it either:
+        # the settled event is cleared here and ensure_agent_materialized
+        # holds a fork-backed spawn until the pass re-sets it, so a fork
+        # carrying grants the ceiling has since tightened away is re-filtered
+        # before any session consumes it.
+        _fork_refresh_settled.clear()
+
+        def _run_deferred() -> None:
+            global _fork_refresh_failed
+            try:
+                _refresh_forked_templates(gated_off=gated_off)
+            except Exception:
+                # The pass died before per-fork accounting: no fork can be
+                # trusted as refreshed, so all fork-backed spawns stay blocked.
+                _fork_refresh_failed = frozenset({"*"})
+                logger.warning("deferred fork refresh failed", exc_info=True)
+            finally:
+                _fork_refresh_settled.set()
+
+        try:
+            threading.Thread(target=_run_deferred, name="fork-refresh", daemon=True).start()
+        except Exception:
+            # A thread that never started can never set the event; leaving it
+            # cleared would hold every fork spawn for the full wait budget.
+            _fork_refresh_settled.set()
+            raise
+    elif refresh_forks:
+        try:
+            _refresh_forked_templates(gated_off=gated_off)
+        except Exception:
+            logger.debug("forked template refresh failed", exc_info=True)
+
     # Security: sanitize invalid hook keys in agent configs
     repair_agent_configs()
 
     return path
+
+
+# Serializes refresh passes and scopes the settled-event lifecycle: the event
+# is cleared for the COMPLETE duration of any refresh — boot-deferred or
+# synchronous — and set only after per-fork accounting has been recorded.
+_fork_refresh_lock = threading.Lock()
+
+# Set while no fork refresh is in progress. Cleared by _refresh_forked_templates
+# for its complete lifecycle (and by the boot deferral before its thread starts,
+# to close the pre-start window), so require_fork_governance holds fork-backed
+# spawns until governance has been re-projected and accounted.
+_fork_refresh_settled = threading.Event()
+_fork_refresh_settled.set()
+
+# Fork names whose LAST refresh attempt failed, with "*" meaning the pass died
+# before per-fork accounting. Assigned whole (never mutated in place) by
+# _refresh_forked_templates and the deferred runner, read by
+# require_fork_governance — a fork in this set may NOT start a session, because
+# its on-disk allowedTools/autoApprove were never re-filtered against the
+# current ceiling and neither ever reaches the PreToolUse gate.
+_fork_refresh_failed: frozenset[str] = frozenset()
+
+# Bounded so the spawn path's never-hangs contract survives a wedged refresh
+# thread; a module constant so tests can shrink it. A timeout is treated as a
+# FAILURE (spawn aborted), never as a release.
+_FORK_REFRESH_WAIT_SECS = 60.0
+
+
+class ForkGovernanceUnresolved(RuntimeError):
+    """A fork-backed agent may not start: fork governance is not projected."""
+
+
+def require_fork_governance(agent: str | None) -> None:
+    """Fail closed: block a fork-backed session start until fork governance is
+    re-projected, and ABORT it when the projection failed or timed out.
+
+    A fork's ``allowedTools``/``autoApprove`` bypass the PreToolUse gate, so a
+    session consuming a fork the refresh never re-filtered would run grants the
+    ceiling has since tightened away. Non-fork agents never wait and never
+    raise. Raises :class:`ForkGovernanceUnresolved` only.
+    """
+    if not agent:
+        return
+    try:
+        is_fork = agent_state.get_fork_info(agent) is not None
+    except Exception as exc:
+        # Unreadable lineage fails CLOSED: treating a missing/corrupt sidecar
+        # read as "not a fork" would start a session whose grants predate the
+        # tightened ceiling. A VERIFIED non-fork is a successful read that
+        # returned no lineage — only that may pass without waiting.
+        raise ForkGovernanceUnresolved(
+            f"cannot verify whether agent {agent!r} is a private template "
+            "copy (lineage sidecar unreadable); refusing to start a session "
+            "on unverifiable permissions"
+        ) from exc
+    if not is_fork:
+        return
+    if not _fork_refresh_settled.wait(timeout=_FORK_REFRESH_WAIT_SECS):
+        raise ForkGovernanceUnresolved(
+            f"agent {agent!r} is a private template copy and its governance "
+            f"refresh did not complete within {_FORK_REFRESH_WAIT_SECS:.0f}s; "
+            "refusing to start a session on unrefreshed permissions"
+        )
+    failed = _fork_refresh_failed
+    if agent in failed or "*" in failed:
+        raise ForkGovernanceUnresolved(
+            f"agent {agent!r} is a private template copy whose governance "
+            "refresh failed; refusing to start a session on stale permissions "
+            "(see the gateway log for the refresh error)"
+        )
+
+
+def _refresh_forked_templates(*, gated_off: "frozenset[str] | None" = None) -> None:
+    """Refresh every fork under the spawn gate: the settled event stays
+    cleared for the COMPLETE pass — synchronous callers (rebind, setup)
+    included, not just the boot deferral — and is re-set only after per-fork
+    accounting has been recorded, so no spawn can consume a fork mid-pass
+    with grants the pass has not yet re-filtered."""
+    with _fork_refresh_lock:
+        _fork_refresh_settled.clear()
+        try:
+            _refresh_forked_templates_locked(gated_off=gated_off)
+        finally:
+            _fork_refresh_settled.set()
+
+
+def _refresh_forked_templates_locked(*, gated_off: "frozenset[str] | None" = None) -> None:
+    """Refresh machine-maintained fields in every fork of an owned template.
+
+    A fork copies the built-in template verbatim, including plumbing setup
+    recomputes on every run: managed MCP server commands (absolute interpreter
+    paths), security hooks, the data-home pin. Frozen, that plumbing rots
+    silently — a stale interpreter path stops every managed tool from starting.
+    So forks get the same merge-preserving refresh ``kirocrew.json`` gets, in
+    ``fork`` mode (human-edited fields untouched; see _refresh_dynamic_fields).
+
+    Only forks whose origin CHAIN reaches a Kiro Crew-owned template get the
+    PLUMBING refresh: a fork of a user's custom template inherits no machine
+    plumbing (setup never composes non-owned specs), and refreshing it would
+    stamp kirocrew's prompt and hooks onto an unrelated spec. The GOVERNANCE
+    passes (ceiling + auto-approve strip) run for every corroborated fork
+    regardless of origin — no other writer sanitizes these files.
+    """
+    forks = agent_state.all_fork_info()
+    global _fork_refresh_failed
+    if not forks:
+        _fork_refresh_failed = frozenset()
+        return
+    owned_names = {Path(f).stem for f in OWNED_KIRO_AGENT_FILES}
+    # The sidecar is agent-writable, so lineage alone must never drive a write:
+    # a fork qualifies only when config.json corroborates it — the crew named
+    # by ``private_to`` is actually bound to this spec.
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig  # circular import
+
+        cfg_agents = KiroCrewConfig.load().agents
+    except Exception:
+        # No corroboration possible means no fork was refreshed: every
+        # fork-backed session stays blocked rather than running stale grants.
+        _fork_refresh_failed = frozenset({"*"})
+        logger.warning("fork refresh skipped: config unreadable", exc_info=True)
+        return
+
+    def _binding_corroborates(name: str) -> bool:
+        crew = forks[name].get("private_to")
+        bound = cfg_agents.get(crew) if isinstance(crew, str) else None
+        return bound is not None and bound.kiro_agent == name
+
+    def _origin_is_owned(name: str) -> bool:
+        seen: set[str] = set()
+        while name in forks and name not in seen:
+            seen.add(name)
+            name = forks[name]["forked_from"]
+        return name in owned_names
+
+    agents_dir = kiro_agents_dir_path()
+    failures: set[str] = set()
+    for fork_name in sorted(forks):
+        # Owned specs have their own writer; this path must never touch them.
+        if fork_name in owned_names:
+            continue
+        if not _binding_corroborates(fork_name):
+            # The sidecar is agent-writable: lineage alone must never drive a
+            # write to a spec file — governance included. But an ORPHANED fork
+            # (lineage with no crew binding) also cannot be trusted as
+            # refreshed: its grants were never re-filtered, so record it as a
+            # failure — no write happens, require_fork_governance simply
+            # refuses to start sessions on it. Self-healing: rebinding a crew
+            # triggers a refresh, which corroborates and clears the record.
+            failures.add(fork_name)
+            continue
+        # Origin gates ONLY the plumbing refresh: setup never composes
+        # non-owned specs, so a custom-template fork inherits no machine
+        # plumbing. Governance is origin-independent — a corroborated fork's
+        # allowedTools/autoApprove face the same ceiling regardless of what it
+        # was forked from, and no other writer sanitizes these files, so
+        # skipping them here would leave stale grants live past a tightening.
+        plumb = _origin_is_owned(fork_name)
+        # The WHOLE per-fork body is fenced: one fork's failure is recorded and
+        # the loop moves on, so a mid-loop error can neither strand the later
+        # forks unrefreshed nor release this one's session gate — a fork in
+        # `failures` is refused by require_fork_governance.
+        try:
+            # Resolve the ACTUAL spec file (declared name wins over the stem,
+            # same as every other resolver) rather than reconstructing
+            # `<name>.json`: a stem/name divergence would otherwise make the
+            # refresh silently skip the real file and leave its grants stale.
+            try:
+                spec_path = agent_spec_path(fork_name)
+            except ValueError:
+                # Two specs declare this name — which is live is undefined, so
+                # neither can be trusted as refreshed. Fail closed.
+                failures.add(fork_name)
+                logger.warning("fork refresh: ambiguous spec name %r", fork_name)
+                continue
+            if spec_path is None:
+                # No spec on disk: nothing carries grants, nothing to refresh.
+                continue
+            # The whole read-modify-write sits under the shared spec lock: a
+            # refresh that reads, loses the CPU to a dashboard PATCH, then
+            # writes its stale snapshot would silently revert the user's edit.
+            with agents_spec_lock(agents_dir):
+                config = _load_json(spec_path)
+                if not isinstance(config, dict):
+                    # Unreadable spec: governance cannot be projected onto it.
+                    failures.add(fork_name)
+                    continue
+                if plumb:
+                    try:
+                        _refresh_dynamic_fields(config, gated_off=gated_off, fork=True)
+                    except Exception:
+                        # Plumbing rot is recoverable; the governance passes
+                        # below still run and write, so a plumbing bug never
+                        # leaves stale grants on disk.
+                        logger.debug(
+                            "refresh failed for forked template %r", fork_name, exc_info=True
+                        )
+                # Governance passes, same as every other spec writer:
+                # allowedTools and autoApprove are the two paths that never
+                # reach the PreToolUse gate, so a fork carrying grants the
+                # ceiling later tightened against must be re-filtered on every
+                # refresh — this writer is exactly where a stale grant would
+                # otherwise persist verbatim.
+                _apply_allowed_tools_ceiling(config, source=f"fork-refresh:{fork_name}")
+                servers_map = config.get("mcpServers")
+                if isinstance(servers_map, dict):
+                    config["mcpServers"] = _strip_ungoverned_auto_approve(servers_map)
+                agent_state.lift_and_strip_bookkeeping(config, fork_name)
+                _atomic_json_write(spec_path, config)
+        except Exception:
+            failures.add(fork_name)
+            logger.warning(
+                "fork refresh failed for %r; its sessions stay blocked", fork_name, exc_info=True
+            )
+    _fork_refresh_failed = frozenset(failures)
 
 
 # Backward-compat alias — callers may still use the old name.

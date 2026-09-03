@@ -8862,6 +8862,39 @@ _WRITE_PROTECTED_HOME_PATHS += [
     f"{prefix}/app-sources"
     for prefix in _CREW_HOME_PREFIXES
 ]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The per-agent bookkeeping sidecar (agent_state.py, ``agent_model_state.json``
+    # directly under the crew home). It is the same input-to-an-authorization-decision
+    # class as rotation.yaml and the OMC index: besides model bookkeeping it records
+    # FORK LINEAGE — ``forked_from`` / ``private_to`` mark a template as ONE crew's
+    # private copy of a shared one (blueprint / copy-on-first-edit semantics). The
+    # fork endpoint reads this lineage to decide whether a template is already the
+    # crew's own copy; a prompt-injected agent that could write it would forge a
+    # ``private_to`` entry naming a SHARED template, so the fork returns
+    # ``already_private`` and the owner's next PATCH lands on the shared file instead
+    # of forking a copy — silently mutating a template other crews depend on. Nothing
+    # downstream neutralizes the forgery: the fork/PATCH path trusts the sidecar as
+    # its own record. Found in review (GPT round 13, F1).
+    #
+    # WRITE-protected, NOT read+write sensitive: it holds no secret and is READ
+    # constantly (``list_agents`` enriches every row with fork info, model resolution
+    # reads ``model_managed`` / ``cc_model``), so classifying it sensitive would break
+    # those reads. Only the agent's own file-edit tool is refused; every internal
+    # writer (agent_state._write via ``atomic_write``) opens the path directly and does
+    # not route through this gate, so the dashboard fork/PATCH and the CLI model-state
+    # writes keep working.
+    #
+    # Its ``.lock`` sibling (``agent_model_state.json.lock``) and the mkstemp temp
+    # ``atomic_write`` renames over it (``tmpXXXX.tmp``, same directory) are ALREADY
+    # fenced read+write by the keystone-artifact rule: the crew home root is a
+    # ``_KEYSTONE_ARTIFACT_PARENTS`` entry (``.env`` lives there), so any ``.tmp`` /
+    # ``.lock`` in it hits ``_is_keystone_publish_artifact``. This entry closes the
+    # remaining gap — the sidecar's own FINAL name, which is neither a secret leaf nor
+    # a ``.tmp``/``.lock`` artifact. Paired with the same leaf in
+    # _WRITE_PROTECTED_BASH_LEAVES — protected on one path only is not protected.
+    f"{prefix}/agent_model_state.json"
+    for prefix in _CREW_HOME_PREFIXES
+]
 
 # ── kiro-cli agent-spec directory (~/.kiro/agents) ──
 # The user-level directory kiro-cli reads its ``--agent <name>`` specs from
@@ -8999,6 +9032,22 @@ _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
     # cover everything beneath it, which is what the trust decision needs (any file the
     # loader might open, not one filename).
     "models",
+    # The per-agent bookkeeping sidecar (agent_state.py). Paired with the same leaf in
+    # _WRITE_PROTECTED_HOME_PATHS so the file-edit and shell paths agree — a leaf on
+    # only one of the two is reachable through the other. It meets the input-to-an-
+    # authorization-decision bar: its ``forked_from`` / ``private_to`` lineage is what
+    # the fork endpoint trusts to decide a template is already a crew's private copy, so
+    # a shell-forged entry naming a SHARED template makes the owner's next PATCH mutate
+    # the shared file — and unlike config.json's inflated values, nothing downstream
+    # clamps a forged lineage, so the file-edit-gate-only footing would be too weak.
+    # Naming-based blocking incidentally denies bash READS of this leaf too, which is
+    # harmless: it holds no secret and its only legitimate readers are Python
+    # (``agent_state._read``, ``list_agents``), never bash. ``agent_state._write`` writes
+    # it through ``atomic_write`` in Python, not via bash, so both writes are unaffected.
+    # Also in _BARE_TOKEN_PROTECTED_LEAVES: lineage is a grant nothing downstream
+    # clamps, so the ``cd``-relative residual the anchored form accepts elsewhere
+    # is not acceptable here — same conclusion as the alias record below.
+    "agent_model_state.json",
 )
 
 # ── Anchor-INDEPENDENT leaf matching ──
@@ -9039,6 +9088,14 @@ _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
 _BARE_TOKEN_PROTECTED_LEAVES: tuple[str, ...] = (
     "connections-tool-aliases.json",
     "settings_seeds.json",
+    # The fork-lineage sidecar, here for the identical reason: its
+    # ``forked_from`` / ``private_to`` entries ARE the grant the fork endpoint
+    # trusts to let a PATCH mutate a spec file in place, and nothing downstream
+    # clamps a forged lineage — so a ``cd ~/.kiro/crew`` relative write reaching
+    # past the anchored entry forges exactly the permission the fence exists to
+    # withhold. The SCOPE test is met: a ``_``-joined name that is not a word
+    # anyone types, occurring in no ordinary command line.
+    "agent_model_state.json",
 )
 
 # Whisper weight files, matched as a NAME with no anchor, for the same reason as the
