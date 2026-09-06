@@ -21,15 +21,19 @@ from aiohttp import web
 
 from kiro_crew import aws_consent
 from kiro_crew.config.loader import config_path
+from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.slack.handler import _vc
 from kiro_crew.voice_reply import (
-    PROVIDER_PIPER,
     PROVIDER_POLLY,
+    PROVIDER_SYSTEM,
     VALID_ENGINES,
     VALID_PROVIDERS,
+    SystemVoiceProbeError,
+    list_system_voices,
     resolve_polly_cli,
+    resolve_system_tts_async,
     stitch_mp3s,
     streaming_voice_reply,
     synthesize_speech,
@@ -88,14 +92,15 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 "piper_model": _vc.piper_model,
                 "piper_model_config": _vc.piper_model_config,
                 "piper_length_scale": _vc.piper_length_scale,
+                "system_voice": _vc.system_voice,
             }
         )
 
     # PUT — update and persist
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
 
     # Update in-memory
     # ``in VALID_PROVIDERS`` would raise TypeError on an unhashable JSON value
@@ -126,6 +131,8 @@ async def api_voice_config(request: web.Request) -> web.Response:
         _vc.piper_model = str(body["piper_model"]).strip()
     if "piper_model_config" in body:
         _vc.piper_model_config = str(body["piper_model_config"]).strip()
+    if "system_voice" in body:
+        _vc.system_voice = str(body["system_voice"]).strip()
     if "piper_length_scale" in body:
         # Coerce to finite/positive via the shared validator (rejects non-numeric,
         # inf/NaN, and <=0) so a bad value can't reach synthesis or be persisted
@@ -158,6 +165,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 "piper_model": _vc.piper_model,
                 "piper_model_config": _vc.piper_model_config,
                 "piper_length_scale": _vc.piper_length_scale,
+                "system_voice": _vc.system_voice,
             }
         )
         cfg["voice_reply"] = vr
@@ -178,10 +186,10 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
     """
 
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
 
     text = body.get("text", "").strip()
     slot_key = body.get("slot", "")
@@ -197,11 +205,13 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
     rate = body.get("rate", _vc.default_rate)
     pitch = body.get("pitch", _vc.default_pitch)
 
-    # Piper produces a single local WAV (not sentence-chunked SSML like Polly).
-    # streaming_voice_reply is Polly-only, so route the selected provider through
-    # the provider-aware synthesize_speech and emit one chunk + complete —
-    # otherwise the DEFAULT (Piper) provider would yield no dashboard audio.
-    if _vc.provider == PROVIDER_PIPER:
+    # Only Polly is sentence-chunked SSML; the local providers each produce a
+    # single WAV. ``streaming_voice_reply`` is Polly-only, so route anything else
+    # through the provider-aware ``synthesize_speech`` and emit one chunk +
+    # complete. Written as "not Polly" rather than a per-provider list so a
+    # provider added later cannot silently fall into the Polly branch and reach
+    # a paid AWS service.
+    if _vc.provider != PROVIDER_POLLY:
         return await _synthesize_nonstreaming(state, text, slot_key)
 
     chunk_paths: list[str] = []
@@ -272,7 +282,7 @@ async def _synthesize_nonstreaming(
     """Synthesize one clip via the provider-aware ``synthesize_speech`` and emit
     it as a single ``voice_chunk`` + ``voice_complete``.
 
-    Used for providers (Piper) that produce a single local file rather than the
+    Used for the local providers, which produce a single file rather than the
     sentence-chunked Polly SSML stream. The audio is delivered whole; the
     dashboard player already handles a single-chunk reply.
     """
@@ -281,13 +291,42 @@ async def _synthesize_nonstreaming(
         audio_path = await synthesize_speech(
             text,
             provider=_vc.provider,
+            rate=_vc.default_rate,
             piper_binary=_vc.piper_binary,
             piper_model=_vc.piper_model,
             piper_model_config=_vc.piper_model_config,
             length_scale=_vc.piper_length_scale,
+            system_voice=_vc.system_voice,
         )
         if not audio_path:
-            msg = "Piper TTS unavailable — check the piper binary and model path in Voice settings."
+            # The two local providers fail for unrelated reasons, and a wrong
+            # remedy costs the user the whole debugging session. For the system
+            # provider that means PROBING rather than assuming: synthesis also
+            # returns None with an engine present — a stale persisted
+            # ``system_voice`` the engine rejects, a timeout, a sandbox refusal —
+            # and telling that user to install espeak-ng sends them to fix
+            # something that is not broken.
+            if _vc.provider == PROVIDER_SYSTEM:
+                from kiro_crew.voice_reply import resolve_system_tts_async
+
+                resolved = await resolve_system_tts_async()
+                if resolved is None:
+                    msg = (
+                        "System TTS unavailable — this host has no built-in speech "
+                        "engine. Install espeak-ng, or pick another provider in "
+                        "Voice settings."
+                    )
+                else:
+                    msg = (
+                        f"System TTS failed — the host's {resolved[0]} engine is "
+                        "installed but produced no audio. Check the voice and "
+                        "speed in Voice settings, or see the gateway log."
+                    )
+            else:
+                msg = (
+                    "Piper TTS unavailable — check the piper binary and model "
+                    "path in Voice settings."
+                )
             state.broadcast_ws("voice_error", {"slot": slot_key, "error": msg})
             return web.json_response({"ok": False, "error": msg}, status=502)
         audio_bytes = await asyncio.to_thread(_read_audio, audio_path)
@@ -308,7 +347,7 @@ async def _synthesize_nonstreaming(
         )
         return web.json_response({"ok": True, "chunks": 1})
     except Exception as exc:
-        logger.exception("Piper voice synthesis failed")
+        logger.exception("Local voice synthesis failed")
         err_msg, _ = redact_exfiltration_urls(str(exc))
         err_msg, _ = redact_credentials(err_msg)
         state.broadcast_ws("voice_error", {"slot": slot_key, "error": err_msg})
@@ -324,6 +363,52 @@ async def _synthesize_nonstreaming(
 _voices_cache: list[dict] | None = None
 _voices_cache_ts: float = 0.0
 _VOICES_CACHE_TTL = 3600  # 1 hour
+
+_system_voices_cache: list[dict[str, str]] | None = None
+_system_voices_cache_ts: float = 0.0
+
+
+async def api_voice_system_voices(request: web.Request) -> web.Response:
+    """GET /api/voice/system-voices — the host engine's voices (cached 1h).
+
+    ``available`` is what the panel needs to distinguish "this host has no
+    built-in engine" from "the engine has no selectable voices": the first is a
+    Linux box without espeak-ng and needs an install, the second is a working
+    engine the user simply cannot pick a voice on.
+    """
+    global _system_voices_cache, _system_voices_cache_ts
+
+    if await resolve_system_tts_async() is None:
+        return web.json_response({"available": False, "voices": []})
+
+    now = time.time()
+    if (
+        _system_voices_cache is not None
+        and (now - _system_voices_cache_ts) < _VOICES_CACHE_TTL
+    ):
+        return web.json_response({"available": True, "voices": _system_voices_cache})
+    try:
+        voices = await list_system_voices()
+    except SystemVoiceProbeError:
+        # Named rather than swallowed by the broad catch below: this is the one
+        # failure the panel can act on, and the code it returns claims exactly
+        # that the probe failed.
+        logger.warning("System voice enumeration failed")
+        return web.json_response(
+            {"error": "Failed to retrieve voices", "code": "system_voices_probe_failed"},
+            status=502,
+        )
+    except Exception:
+        logger.exception("System voice enumeration raised unexpectedly")
+        return web.json_response(
+            {"error": "Failed to retrieve voices", "code": "system_voices_probe_failed"},
+            status=502,
+        )
+    # Cached even when empty: the answer is stable for the life of the install,
+    # and re-probing on every panel open costs a subprocess per visit.
+    _system_voices_cache = voices
+    _system_voices_cache_ts = now
+    return web.json_response({"available": True, "voices": voices})
 
 
 async def api_voice_voices(request: web.Request) -> web.Response:

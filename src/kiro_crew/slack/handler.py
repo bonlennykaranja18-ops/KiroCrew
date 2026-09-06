@@ -144,8 +144,15 @@ from kiro_crew.stats import Stats
 from kiro_crew.subagent import SubagentManager
 from kiro_crew.task import Task
 from kiro_crew.taskrunner import TaskRunner
-from kiro_crew.voice_reply import DEFAULT_PROVIDER, VALID_PROVIDERS
+from kiro_crew.voice_reply import (
+    DEFAULT_PROVIDER,
+    PROVIDER_PIPER,
+    PROVIDER_SYSTEM,
+)
 from kiro_crew.voice_reply import is_available as _tts_available
+from kiro_crew.voice_reply import (
+    resolve_configured_provider,
+)
 from kiro_crew.voice_reply import validate_length_scale as _validate_length_scale
 from kiro_crew.voice_reply import voice_reply as _voice_reply_fn
 
@@ -560,18 +567,21 @@ class _VoiceConfig:
     default_pitch: str = "+0%"
     aws_profile: str = ""
     region: str = ""
-    # TTS provider. Defaults to the LOCAL provider (Piper), matching
+    # TTS provider. Defaults to the LOCAL provider, matching
     # ``voice_reply.DEFAULT_PROVIDER``. It used to default to "polly" here,
     # which meant enabling voice reply without naming a provider silently sent
     # text to a paid AWS service under whatever the ambient credential chain
     # resolved to. Sourced from the single constant so the two cannot drift
     # again.
     provider: str = DEFAULT_PROVIDER
-    # Piper-specific (ignored when provider="polly"):
+    # Piper-specific (ignored by the other providers):
     piper_binary: str = ""
     piper_model: str = ""
     piper_model_config: str = ""
     piper_length_scale: float = 1.0
+    # Built-in-engine voice. Empty means the OS default voice, which is the
+    # right answer whenever the host language matches the reply language.
+    system_voice: str = ""
     # If True, a message carrying voice input (a transcribed voice memo)
     # automatically receives a voice reply, even without `!voice on`. The
     # config-load default follows ``enabled`` (see ``set_orch_cfg``); the
@@ -1181,6 +1191,18 @@ def set_orch_cfg(cfg: KiroCrewConfig) -> None:
     load_voice_reply_config(cfg)
 
 
+def _str_or_empty(value: object) -> str:
+    """Return *value* when it is a string, else ``""``.
+
+    Config paths and voice names are read from hand-editable JSON, so a dict,
+    list or number can arrive where a string is expected. Empty means "unset"
+    everywhere these are consumed, which is the safe reading of a wrong type —
+    ``str(value)`` would instead persist ``"{}"`` as a voice name or a binary
+    path and push the failure downstream into synthesis.
+    """
+    return value if isinstance(value, str) else ""
+
+
 def load_voice_reply_config(cfg: "KiroCrewConfig | None" = None) -> None:
     """Populate the live voice state (``_vc``) from config's ``voice_reply``.
 
@@ -1213,29 +1235,20 @@ def load_voice_reply_config(cfg: "KiroCrewConfig | None" = None) -> None:
     # users who turn voice on globally also get symmetric voice-in/voice-out
     # without needing to set a second flag.
     _vc.auto_reply_to_voice = bool(_vr.get("auto_reply_to_voice", _enabled))
-    # Validate provider on load — a typo (e.g. "ploly") would otherwise pass
-    # through and only fail at synthesis time, after the user has already sent
-    # a voice memo expecting a voice reply.
-    #
-    # Both the absent-key default and the invalid-value fallback resolve to the
-    # LOCAL provider. They previously resolved to "polly", so a config that
-    # enabled voice reply without naming a provider — or that named one with a
-    # typo — reached a paid AWS service with no operator decision behind it.
-    # Falling back to local is also the safer half of the pair: a wrong local
-    # provider costs nothing and degrades to a "TTS isn't configured" notice.
-    _provider = _vr.get("provider", DEFAULT_PROVIDER)
-    if _provider not in VALID_PROVIDERS:
-        logger.warning(
-            "voice_reply.provider %r not in %s, defaulting to %r",
-            _provider,
-            sorted(VALID_PROVIDERS),
-            DEFAULT_PROVIDER,
-        )
-        _provider = DEFAULT_PROVIDER
-    _vc.provider = _provider
-    _vc.piper_binary = _vr.get("piper_binary", "")
-    _vc.piper_model = _vr.get("piper_model", "")
-    _vc.piper_model_config = _vr.get("piper_model_config", "")
+    # Resolution rules (validate-or-default, and keep an existing Piper install)
+    # live in one shared resolver so this loader, the Telegram settings path, and
+    # the dashboard cannot drift apart on them.
+    _vc.provider = resolve_configured_provider(_vr)
+    # `config.json` is hand-editable, so any of these can arrive as a dict, list
+    # or number. They flow straight to the dashboard's config GET, where a
+    # non-string crashes the React panel that renders it — so a wrong TYPE is
+    # normalised to "unset" rather than stringified, which would persist a
+    # garbage value like "{}" as a voice name. Same reasoning as the length-scale
+    # coercion below; these four were simply not covered by it.
+    _vc.piper_binary = _str_or_empty(_vr.get("piper_binary", ""))
+    _vc.piper_model = _str_or_empty(_vr.get("piper_model", ""))
+    _vc.piper_model_config = _str_or_empty(_vr.get("piper_model_config", ""))
+    _vc.system_voice = _str_or_empty(_vr.get("system_voice", ""))
     # Coerce to finite/positive — a config.json with inf/NaN (JSON accepts both)
     # would otherwise reach synthesis and be re-serialized as non-RFC JSON,
     # breaking the dashboard's config GET.
@@ -1411,6 +1424,7 @@ async def _safe_voice_reply(
             piper_model=_vc.piper_model,
             piper_model_config=_vc.piper_model_config,
             length_scale=_vc.piper_length_scale,
+            system_voice=_vc.system_voice,
         )
     except Exception:
         logger.debug("Voice reply failed", exc_info=True)
@@ -4251,7 +4265,13 @@ async def handle_message(
     voice_auto_reply = had_voice_input and _vc.auto_reply_to_voice
     if _vc.global_enabled or session_key in _vc.sessions or voice_auto_reply:
         if len(accumulated) >= 50:
-            _tts_ok = _tts_available(
+            # Off the loop: the probe stats fixed directories (and, for Polly,
+            # searches PATH). A stat is unbounded — one on a stalled network or
+            # fuse mount would freeze every session and heartbeat sharing this
+            # loop — and the same rule governs ``resolve_system_tts_async``,
+            # which this reaches for the built-in provider.
+            _tts_ok = await asyncio.to_thread(
+                _tts_available,
                 provider=_vc.provider,
                 piper_binary=_vc.piper_binary,
                 piper_model=_vc.piper_model,
@@ -4262,11 +4282,17 @@ async def handle_message(
                 # available. Post a one-shot ephemeral so the user knows the
                 # response fell back to text only — silent fallback is worse
                 # UX for users who explicitly opted in.
-                if _vc.provider == "piper":
+                if _vc.provider == PROVIDER_SYSTEM:
+                    # Only reachable on a host whose built-in engine is absent,
+                    # which in practice means a Linux box without espeak-ng.
                     hint = (
-                        "Install piper (`pip install piper-tts` in a Python "
-                        "3.11 venv) and set `voice_reply.piper_model` to your "
-                        "voice .onnx file."
+                        "Install the host speech engine (`espeak-ng`) or pick "
+                        "another provider in Voice settings."
+                    )
+                elif _vc.provider == PROVIDER_PIPER:
+                    hint = (
+                        "Install piper (`pip install piper-tts`) and set "
+                        "`voice_reply.piper_model` to your voice .onnx file."
                     )
                 else:
                     hint = "Run `ada credentials update` and ensure `aws` CLI " "is on PATH."

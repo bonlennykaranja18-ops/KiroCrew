@@ -26,6 +26,47 @@ def _make_voice_app(state):
 
 class TestVoiceConfig:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("body", "expect_code"),
+        [
+            (["system_voice"], True),
+            (["engine"], True),
+            ("system_voice", True),
+            (42, True),
+            (None, False),
+        ],
+        ids=["list-with-key", "list-with-legacy-key", "bare-string", "number", "null"],
+    )
+    async def test_non_object_body_is_rejected_not_a_500(
+        self, tmp_path, monkeypatch, body, expect_code
+    ):
+        """A JSON body that is not an object must be a 400, never a crash.
+
+        ``"system_voice" in body`` is a MEMBERSHIP test over a list's elements, so
+        ``["system_voice"]`` passes that guard and then raises TypeError on the
+        subscript — an unhandled 500. A bare string or number fails the same way,
+        and the synthesize endpoint's ``body.get`` raises AttributeError. Covers a
+        key this PR adds and a pre-existing one, because the shape check has to be
+        per-request, not per-key.
+
+        The guard is `read_bounded_json`, the shared helper that already owns this
+        for the endpoints routed through it, so the code asserted is its
+        ``body_not_object`` rather than a fifth private spelling — the divergence
+        tracked on issue #5587.
+
+        ``None`` reaches the 400 through the parse branch instead, which reports
+        ``invalid_json``; asserted separately rather than folded in, so this test
+        cannot be read as claiming a guarantee that branch does not make.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.put("/api/voice/config", json=body)
+            assert resp.status == 400, f"{body!r} produced {resp.status}"
+            if expect_code:
+                assert (await resp.json())["code"] == "body_not_object"
+
+    @pytest.mark.asyncio
     async def test_get_config(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
@@ -42,6 +83,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -76,6 +118,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -133,6 +176,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -165,6 +209,7 @@ class TestVoiceConfig:
             piper_model="~/m.onnx",
             piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -194,6 +239,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -235,6 +281,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -267,6 +314,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -297,6 +345,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -333,6 +382,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -367,6 +417,7 @@ class TestVoiceConfig:
             piper_model="",
             piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -395,6 +446,7 @@ class TestVoiceConfig:
             default_rate="100%", default_pitch="0%", aws_profile="", region="",
             piper_binary="", piper_model="~/m.onnx", piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
 
@@ -452,6 +504,10 @@ class TestVoiceSynthesize:
     async def test_synthesize_success(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
+            # Named explicitly: routing sends every non-Polly provider to the
+            # single-file path, so leaving this to MagicMock's auto-attribute
+            # would exercise the wrong branch from the one mocked below.
+            provider="polly",
             default_voice="Joanna", default_engine="neural",
             default_rate="100%", default_pitch="0%", aws_profile="", region="us-east-1",
         )
@@ -494,6 +550,7 @@ class TestVoiceSynthesize:
             default_rate="100%", default_pitch="0%", aws_profile="", region="",
             piper_binary="", piper_model="~/m.onnx", piper_model_config="",
             piper_length_scale=1.0,
+            system_voice="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
 
@@ -599,6 +656,10 @@ class TestVoiceSynthesize:
     async def test_synthesize_exception_returns_500_and_broadcasts_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
+            # Named explicitly: routing sends every non-Polly provider to the
+            # single-file path, so leaving this to MagicMock's auto-attribute
+            # would exercise the wrong branch from the one mocked below.
+            provider="polly",
             default_voice="Joanna", default_engine="neural",
             default_rate="100%", default_pitch="0%", aws_profile="", region="us-east-1",
         )
@@ -914,3 +975,222 @@ class TestVoiceVoices:
             assert resp.status == 200
             data = await resp.json()
             assert data == {"voices": []}
+
+
+class TestVoiceSystemVoices:
+    def _app(self, tmp_path):
+        from kiro_crew.dashboard.chat_voice import api_voice_system_voices
+
+        app = web.Application()
+        app["state"] = _make_state(tmp_path)
+        app.router.add_get("/api/voice/system-voices", api_voice_system_voices)
+        return app
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._system_voices_cache", None)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._system_voices_cache_ts", 0)
+
+    @pytest.mark.asyncio
+    async def test_no_engine_reports_unavailable_without_probing(self, tmp_path, monkeypatch):
+        """A host with no engine answers before spawning anything.
+
+        The panel needs this distinct from "engine present, no voices": the
+        first needs an install, the second does not.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_system_tts_async", AsyncMock(return_value=None)
+        )
+        probe = AsyncMock(return_value=[])
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.list_system_voices", probe)
+
+        async with TestClient(TestServer(self._app(tmp_path))) as client:
+            resp = await client.get("/api/voice/system-voices")
+            assert resp.status == 200
+            assert await resp.json() == {"available": False, "voices": []}
+        probe.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_lists_voices_and_names_the_engine(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_system_tts_async",
+            AsyncMock(return_value=("say", "/usr/bin/say")),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.list_system_voices",
+            AsyncMock(return_value=[{"id": "Alex", "name": "Alex", "language": "en-US"}]),
+        )
+
+        async with TestClient(TestServer(self._app(tmp_path))) as client:
+            resp = await client.get("/api/voice/system-voices")
+            assert resp.status == 200
+            data = await resp.json()
+        assert data["available"] is True
+        assert data["voices"] == [{"id": "Alex", "name": "Alex", "language": "en-US"}]
+        # The response carries only what the panel reads; naming the engine
+        # would be public HTTP surface with no consumer.
+        assert "engine" not in data
+
+    @pytest.mark.asyncio
+    async def test_result_is_cached(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_system_tts_async",
+            AsyncMock(return_value=("say", "/usr/bin/say")),
+        )
+        probe = AsyncMock(return_value=[])
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.list_system_voices", probe)
+
+        async with TestClient(TestServer(self._app(tmp_path))) as client:
+            await client.get("/api/voice/system-voices")
+            await client.get("/api/voice/system-voices")
+        # An empty list is cached too: it is stable for the life of the install,
+        # and re-probing would cost a subprocess per panel visit.
+        assert probe.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_returns_502(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_system_tts_async",
+            AsyncMock(return_value=("say", "/usr/bin/say")),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.list_system_voices",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        )
+
+        async with TestClient(TestServer(self._app(tmp_path))) as client:
+            resp = await client.get("/api/voice/system-voices")
+            assert resp.status == 502
+            body = await resp.json()
+            assert body["error"] == "Failed to retrieve voices"
+            # The dashboard renders `error` verbatim into a localized UI, so the
+            # machine-readable code is the part it can actually translate.
+            assert body["code"] == "system_voices_probe_failed"
+
+
+class TestSynthesizeProviderRouting:
+    """Every non-Polly provider must reach the single-file path.
+
+    Written as "not Polly" in the handler so a provider added later cannot fall
+    into the Polly branch and reach a paid AWS service; these pin that.
+    """
+
+    def _mock_vc(self, provider: str):
+        return MagicMock(
+            provider=provider,
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="110%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            piper_binary="",
+            piper_model="",
+            piper_model_config="",
+            piper_length_scale=1.0,
+            system_voice="Alex",
+        )
+
+    @pytest.mark.asyncio
+    async def test_system_provider_uses_the_single_file_path(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice._vc", self._mock_vc("system")
+        )
+
+        wav = tmp_path / "out.wav"
+        wav.write_bytes(b"RIFF" + b"x" * 200)
+        synth = AsyncMock(return_value=str(wav))
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.synthesize_speech", synth)
+
+        async def unreachable(*a, **kw):
+            raise AssertionError("Polly streaming must not run for a local provider")
+            yield  # noqa: unreachable - keeps this an async generator
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.streaming_voice_reply", unreachable
+        )
+
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        app = web.Application()
+        app["state"] = state
+        from kiro_crew.dashboard.chat_voice import api_voice_synthesize
+
+        app.router.add_post("/api/voice/synthesize", api_voice_synthesize)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/voice/synthesize", json={"text": "Hello", "slot": "s1"}
+            )
+            assert resp.status == 200
+            assert (await resp.json())["chunks"] == 1
+
+        kwargs = synth.await_args.kwargs
+        assert kwargs["provider"] == "system"
+        assert kwargs["system_voice"] == "Alex"
+        # The built-in engine reads speed from the shared rate percentage, so
+        # the configured value has to reach it.
+        assert kwargs["rate"] == "110%"
+        mimes = [
+            call[0][1].get("audioMime")
+            for call in state.broadcast_ws.call_args_list
+            if call[0][0] in ("voice_chunk", "voice_complete")
+        ]
+        assert mimes == ["audio/wav", "audio/wav"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("resolved", "expect_in", "expect_not_in"),
+        [
+            (None, "espeak-ng", "produced no audio"),
+            (("say", "/usr/bin/say"), "produced no audio", "espeak-ng"),
+        ],
+        ids=["engine-absent", "engine-present-but-failed"],
+    )
+    async def test_system_failure_remedy_matches_why_it_failed(
+        self, tmp_path, monkeypatch, resolved, expect_in, expect_not_in
+    ):
+        """The install remedy is only correct when the engine is actually absent.
+
+        Synthesis also returns None with an engine present — a persisted
+        ``system_voice`` the engine rejects, a timeout, a sandbox refusal — and
+        telling that user to install espeak-ng sends them to fix something that
+        is not broken. So the branch is chosen by PROBING, and this pins both
+        sides: an absent engine must still get the install remedy, and a present
+        one must not.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice._vc", self._mock_vc("system")
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.synthesize_speech",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.voice_reply.resolve_system_tts_async",
+            AsyncMock(return_value=resolved),
+        )
+
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        app = web.Application()
+        app["state"] = state
+        from kiro_crew.dashboard.chat_voice import api_voice_synthesize
+
+        app.router.add_post("/api/voice/synthesize", api_voice_synthesize)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/voice/synthesize", json={"text": "Hello", "slot": "s1"}
+            )
+            assert resp.status == 502
+            err = (await resp.json())["error"]
+        assert expect_in in err
+        assert expect_not_in not in err
+        # A remedy naming the wrong provider costs the user the whole debugging
+        # session, so the two local providers must not share one message.
+        assert "piper" not in err.lower()
