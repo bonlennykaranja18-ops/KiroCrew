@@ -79,6 +79,16 @@ def _unavailable(message: str, code: str) -> web.Response:
     return web.json_response({"error": message, "code": code}, status=503)
 
 
+def _conflict(message: str, code: str, crews: list[str]) -> web.Response:
+    """409 — the request is well-formed but something else still depends on it.
+
+    A separate literal-status helper for the same reason the three above are
+    separate: ``test/test_error_code_contract.py`` is a STATIC scan, and a
+    computed ``status=`` lands in its ``dynamic_status`` bucket.
+    """
+    return web.json_response({"error": message, "code": code, "crews": crews}, status=409)
+
+
 def _require_enabled(handler: Handler) -> Handler:
     """403 while disabled, 503 before the runtime is up, 503 if the store cannot write.
 
@@ -100,19 +110,54 @@ def _require_enabled(handler: Handler) -> Handler:
         if not await asyncio.to_thread(is_app_enabled, APP_NAME):
             return _forbidden("crew-companion is disabled", "app_disabled")
         if get_store() is None:
-            return _unavailable(
-                "crew-companion runtime not started", "runtime_not_started"
-            )
+            return _unavailable("crew-companion runtime not started", "runtime_not_started")
         try:
             return await handler(request)
         except OSError:
             # Retryable by nature: the disk may have room, or write permission
             # back, by the time the client tries again.
-            return _unavailable(
-                "crew-companion could not save to disk", "store_write_failed"
-            )
+            return _unavailable("crew-companion could not save to disk", "store_write_failed")
 
     return _wrapped
+
+
+def _require_library_owner(handler: Handler) -> Handler:
+    """``_require_enabled``, plus the shared library's OWNER gate.
+
+    These routes reach the install-wide appearance library, not this app's
+    private directory. Enabled-only was the right gate while the library WAS
+    private; it stopped being right when the same store started deciding what the
+    crew roster draws, because an owner-only dashboard surface with a second door
+    open to any authenticated app token is not owner-only. ``aws_control`` states
+    the rule for a builtin app: such a door "would hand out through one door what
+    is locked behind another".
+
+    Reads are gated too, for the same reason they are on the dashboard side: a
+    pack is user-authored content, and listing someone's library is not a public
+    fact. The enabled check stays FIRST, so a disabled app still answers
+    ``app_disabled`` to everyone and a probe cannot tell "app off" from "not for
+    you".
+    """
+
+    @wraps(handler)
+    async def _wrapped(request: web.Request) -> web.StreamResponse:
+        # circular import, and a HARD one: this package's `__init__` imports this
+        # module at module scope (the `register_routes` re-export the gateway's
+        # startup registration looks for), so ANY dashboard module that imports
+        # the appearance store pulls this file in while it is still initialising.
+        # A module-scope import of the dashboard side therefore fails with
+        # "partially initialized module" depending only on which side the
+        # interpreter reaches first — it broke the macOS gateway suite. Importing
+        # inside the request is unconditionally safe: by then every module is
+        # loaded, and `register_routes` itself runs at startup, not at import.
+        from kiro_crew.dashboard.handlers.appearances import require_library_owner
+
+        denied = await require_library_owner(request, f"{APP_NAME}.{handler.__name__}")
+        if denied is not None:
+            return denied
+        return await handler(request)
+
+    return _require_enabled(_wrapped)
 
 
 async def _body(request: web.Request) -> dict[str, Any]:
@@ -194,9 +239,7 @@ async def _handle_add(request: web.Request) -> web.StreamResponse:
         return _bad_request("everyMinutes must be a positive number", "invalid_recurrence")
 
     try:
-        result = await asyncio.to_thread(
-            store.add, text, fire_at, int(every) if every else None
-        )
+        result = await asyncio.to_thread(store.add, text, fire_at, int(every) if every else None)
     except ValueError as exc:
         return _bad_request(str(exc), "invalid_reminder")
     return web.json_response(result)
@@ -223,9 +266,7 @@ async def _handle_skip(request: web.Request) -> web.StreamResponse:
 async def _handle_config(request: web.Request) -> web.StreamResponse:
     store = get_store()
     assert store is not None
-    return web.json_response(
-        await asyncio.to_thread(store.patch_config, await _body(request))
-    )
+    return web.json_response(await asyncio.to_thread(store.patch_config, await _body(request)))
 
 
 async def _handle_presence(request: web.Request) -> web.StreamResponse:
@@ -260,9 +301,7 @@ async def _handle_window(request: web.Request) -> web.StreamResponse:
     target = (await _body(request)).get("target")
     if target not in ("panel", "gallery"):
         return _bad_request("target must be 'panel' or 'gallery'", "invalid_window")
-    return web.json_response(
-        await asyncio.to_thread(store.queue_window_command, target)
-    )
+    return web.json_response(await asyncio.to_thread(store.queue_window_command, target))
 
 
 # ── Appearance packs ────────────────────────────────────────────────────────
@@ -270,14 +309,14 @@ async def _handle_window(request: web.Request) -> web.StreamResponse:
 
 async def _handle_appearances_get(request: web.Request) -> web.StreamResponse:
     """Every pack the gallery can offer, metadata only."""
-    packs = await asyncio.to_thread(get_appearances().list_packs)
+    packs = await asyncio.to_thread(lambda: get_appearances().list_packs())
     return web.json_response({"packs": packs})
 
 
 async def _handle_appearance_detail(request: web.Request) -> web.StreamResponse:
     """One pack with its art inlined, ready to render."""
     pack_id = request.query.get("id", "")
-    detail = await asyncio.to_thread(get_appearances().pack_detail, pack_id)
+    detail = await asyncio.to_thread(lambda: get_appearances().pack_detail(pack_id))
     if detail is None:
         # Not found rather than a 400: an id that no longer resolves is the normal
         # outcome of a pack the user just deleted, not a malformed request.
@@ -289,7 +328,7 @@ async def _handle_appearance_colours(request: web.Request) -> web.StreamResponse
     """Record a recolouring of a pack."""
     body = await _body(request)
     ok = await asyncio.to_thread(
-        get_appearances().set_colour_map, body.get("id", ""), body.get("colorMap")
+        lambda: get_appearances().set_colour_map(body.get("id", ""), body.get("colorMap"))
     )
     if not ok:
         return _bad_request("could not save those colours", "invalid_colour_map")
@@ -297,10 +336,25 @@ async def _handle_appearance_colours(request: web.Request) -> web.StreamResponse
 
 
 async def _handle_appearance_delete(request: web.Request) -> web.StreamResponse:
-    """Delete a custom pack. The built-in cannot be deleted."""
+    """Delete a custom pack. The built-in cannot be deleted.
+
+    Goes through the SHARED guard, not straight to ``delete_pack``. The library
+    is no longer this app's alone: a crew can wear a pack, so a gallery delete
+    that removed the art out from under it would blank that crew's face with
+    nothing on screen to explain it. The gallery has no force affordance on
+    purpose — the refusal names the crews, and unassigning them is the fix.
+    """
     body = await _body(request)
-    ok = await asyncio.to_thread(get_appearances().delete_pack, body.get("id", ""))
-    if not ok:
+    pack_id = body.get("id", "")
+    # circular import — same hard cycle as in `_require_library_owner`: this
+    # package's `__init__` imports this module at module scope, so the dashboard
+    # side must be reached at call time, never at import.
+    from kiro_crew.dashboard.appearances import delete_pack_if_unworn
+
+    deleted, wearers = await delete_pack_if_unworn(pack_id if isinstance(pack_id, str) else "")
+    if wearers:
+        return _conflict("that pack is still worn by a crew", "pack_in_use", wearers)
+    if not deleted:
         return _bad_request("that pack cannot be deleted", "pack_not_deletable")
     return web.json_response({"ok": True})
 
@@ -309,10 +363,9 @@ async def _handle_appearance_save(request: web.Request) -> web.StreamResponse:
     """Create or replace a custom pack."""
     body = await _body(request)
     ok = await asyncio.to_thread(
-        get_appearances().save_pack,
-        body.get("id", ""),
-        body.get("manifest"),
-        body.get("files"),
+        lambda: get_appearances().save_pack(
+            body.get("id", ""), body.get("manifest"), body.get("files")
+        )
     )
     if not ok:
         return _bad_request("could not save that pack", "invalid_pack")
@@ -322,7 +375,7 @@ async def _handle_appearance_save(request: web.Request) -> web.StreamResponse:
 async def _handle_appearance_export(request: web.Request) -> web.StreamResponse:
     """Hand back a portable bundle for one pack."""
     pack_id = request.query.get("id", "")
-    bundle = await asyncio.to_thread(export_bundle, get_appearances(), pack_id)
+    bundle = await asyncio.to_thread(lambda: export_bundle(get_appearances(), pack_id))
     if bundle is None:
         return _bad_request("no such appearance pack", "pack_not_found")
     return web.json_response(bundle)
@@ -331,7 +384,7 @@ async def _handle_appearance_export(request: web.Request) -> web.StreamResponse:
 async def _handle_appearance_import(request: web.Request) -> web.StreamResponse:
     """Install a pack from an exported bundle."""
     body = await _body(request)
-    result = await asyncio.to_thread(import_bundle, get_appearances(), body.get("bundle"))
+    result = await asyncio.to_thread(lambda: import_bundle(get_appearances(), body.get("bundle")))
     if not result.get("ok"):
         return _bad_request(str(result.get("error", "import failed")), "invalid_bundle")
     return web.json_response(result)
@@ -341,12 +394,13 @@ async def _handle_appearance_save_sprite(request: web.Request) -> web.StreamResp
     """Save a pack whose art is a single sprite sheet."""
     body = await _body(request)
     result = await asyncio.to_thread(
-        save_sprite_pack,
-        get_appearances(),
-        body.get("id", ""),
-        body.get("manifest"),
-        body.get("spriteBase64"),
-        body.get("filename", "sprites.png"),
+        lambda: save_sprite_pack(
+            get_appearances(),
+            body.get("id", ""),
+            body.get("manifest"),
+            body.get("spriteBase64"),
+            body.get("filename", "sprites.png"),
+        )
     )
     if not result.get("ok"):
         return _bad_request(str(result.get("error", "save failed")), "invalid_pack")
@@ -379,30 +433,28 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get(f"{_BASE}/stats", _require_enabled(_handle_stats_get))
     app.router.add_get(f"{_BASE}/pending", _require_enabled(_handle_pending_get))
     app.router.add_post(f"{_BASE}/presence", _require_enabled(_handle_presence))
-    app.router.add_get(f"{_BASE}/appearances", _require_enabled(_handle_appearances_get))
+    app.router.add_get(f"{_BASE}/appearances", _require_library_owner(_handle_appearances_get))
     app.router.add_get(
-        f"{_BASE}/appearances/export", _require_enabled(_handle_appearance_export)
+        f"{_BASE}/appearances/export", _require_library_owner(_handle_appearance_export)
     )
     app.router.add_post(
-        f"{_BASE}/appearances/import", _require_enabled(_handle_appearance_import)
+        f"{_BASE}/appearances/import", _require_library_owner(_handle_appearance_import)
     )
     app.router.add_post(
-        f"{_BASE}/appearances/save-sprite", _require_enabled(_handle_appearance_save_sprite)
+        f"{_BASE}/appearances/save-sprite", _require_library_owner(_handle_appearance_save_sprite)
     )
-    app.router.add_post(f"{_BASE}/petdex/fetch", _require_enabled(_handle_petdex_fetch))
+    app.router.add_post(f"{_BASE}/petdex/fetch", _require_library_owner(_handle_petdex_fetch))
     app.router.add_get(
-        f"{_BASE}/appearances/detail", _require_enabled(_handle_appearance_detail)
+        f"{_BASE}/appearances/detail", _require_library_owner(_handle_appearance_detail)
     )
     app.router.add_post(
-        f"{_BASE}/appearances/colours", _require_enabled(_handle_appearance_colours)
+        f"{_BASE}/appearances/colours", _require_library_owner(_handle_appearance_colours)
     )
     app.router.add_post(
-        f"{_BASE}/appearances/delete", _require_enabled(_handle_appearance_delete)
+        f"{_BASE}/appearances/delete", _require_library_owner(_handle_appearance_delete)
     )
     app.router.add_post(
-        f"{_BASE}/appearances/save", _require_enabled(_handle_appearance_save)
+        f"{_BASE}/appearances/save", _require_library_owner(_handle_appearance_save)
     )
-    app.router.add_post(
-        f"{_BASE}/breathing-done", _require_enabled(_handle_breathing_done)
-    )
+    app.router.add_post(f"{_BASE}/breathing-done", _require_enabled(_handle_breathing_done))
     app.router.add_post(f"{_BASE}/window", _require_enabled(_handle_window))

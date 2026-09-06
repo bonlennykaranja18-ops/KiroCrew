@@ -30,20 +30,38 @@ logger = logging.getLogger(__name__)
 #: because the routes need to reach the same instance, and the dispatcher hands
 #: each hook its own context object.
 _store: CompanionStore | None = None
-_appearances: AppearanceStore | None = None
 
 
 def get_appearances() -> AppearanceStore:
-    """The appearance store.
+    """The appearance store — the install's ONE shared library.
 
-    Unlike the reminder store this is created eagerly on first use rather than by the
-    startup hook: listing packs is a pure read of a directory, so there is nothing to
-    schedule and nothing to tear down — and a gallery that works before the first tick
-    is one less ordering dependency.
+    Delegates to :mod:`kiro_crew.dashboard.appearances` rather than owning an
+    instance of its own. Two reasons, and the second is the load-bearing one:
+
+    * Crews wear packs too, so the library has to be readable while this app is
+      disabled. A store built by this hook would exist only between startup and
+      shutdown.
+    * With two instances there would be two libraries. The gallery would import
+      a pack into the app's directory and the crew roster would look in the data
+      home's, so a pack the user just installed would be missing from the crew
+      editor — and one of the two would silently own the colour maps.
+
+    It is created on first use rather than by the startup hook because listing
+    packs is a pure read of a directory: there is nothing to schedule and
+    nothing to tear down, and a gallery that works before the first tick is one
+    less ordering dependency.
     """
-    if _appearances is None:
-        raise RuntimeError("crew-companion: appearance store not initialised")
-    return _appearances
+    # circular import, and a HARD one: this package's `__init__` imports
+    # `backend/routes.py`, which imports this module — so a dashboard module that
+    # imports the shared store gets pulled through the whole app package while it
+    # is still initialising, and a module-scope import back into the dashboard
+    # fails with "partially initialized module" depending only on which side the
+    # interpreter reached first. That is import-ORDER dependent, so it passed
+    # locally and broke the macOS gateway suite. At call time every module is
+    # loaded and the direction no longer matters.
+    from kiro_crew.dashboard.appearances import get_appearance_store
+
+    return get_appearance_store()
 
 
 def get_store() -> CompanionStore | None:
@@ -63,17 +81,20 @@ async def on_startup(ctx: Any) -> None:
     enabling the app never blocks the gateway on file I/O, the same reason the
     reference builtin's hook is async.
     """
-    global _store, _appearances
+    global _store
 
     data_dir = Path(ctx.data_dir)
 
-    # Before the early return below: shutdown clears this, so a disable-then-enable
-    # cycle would otherwise leave the gallery with no store and every appearance
-    # request raising. It holds no timer, so rebuilding it is free.
-    if _appearances is None:
-        appearances = AppearanceStore(data_dir)
-        await asyncio.to_thread(appearances.load)
-        _appearances = appearances
+    # NOTHING for the appearance library here. This hook runs inside aiohttp's
+    # `runner.setup()`, so every statement in it lands BEFORE the dashboard
+    # socket binds — and building the store scans the packs directory and, once
+    # per install, migrates the app's old private library. That is exactly the
+    # unbounded, maintenance-shaped work the boot path must not carry.
+    #
+    # It costs nothing to defer, because the store's own accessor builds it on
+    # first use and every caller resolves it INSIDE a worker thread, so the
+    # first request pays it off the event loop rather than the launch paying it
+    # on the loop.
 
     if _store is not None:
         # Re-enable after a disable: the same instance resumes rather than
@@ -125,10 +146,7 @@ async def on_shutdown(ctx: Any) -> None:  # noqa: ARG001 — ctx unused, kept fo
 
 def _reset_for_tests() -> None:
     """Drop the process-global runtime. Tests only."""
-    global _store, _appearances
+    global _store
     if _store is not None:
         _store.stop()
     _store = None
-    # The appearance store holds no timer, so there is nothing to stop — but it is
-    # cleared so a re-enable rebuilds it against the data dir it is given then.
-    _appearances = None
