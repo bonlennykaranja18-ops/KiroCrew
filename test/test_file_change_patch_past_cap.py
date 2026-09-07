@@ -177,18 +177,47 @@ def test_a_change_on_both_sides_of_the_cap_is_still_carried(tmp_path):
     assert "tail AFTER" in row["patch"]
 
 
-def test_the_snapshot_read_goes_through_the_symlink_safe_chokepoint(tmp_path, monkeypatch):
-    """`validate_file_path` then `read_text` is a TOCTOU, and the sibling closes it.
+def test_a_crlf_file_reads_back_with_unix_line_endings(tmp_path):
+    """Reading bytes costs universal-newline translation, and it is restored here.
 
-    Between validating a path and reading it, an agent can swap the file for a
-    symlink pointing outside the validated tree; a plain `read_text` follows it and
-    the target's bytes land in message metadata. `hooks.safe_read_file` re-checks
-    the RESOLVED target and opens with `O_NOFOLLOW`, which is why
-    `_reconstruct_str_replace_before` already uses it.
+    A text-mode open (`newline=None`) folds `\\r\\n` and a lone `\\r` to `\\n`;
+    `bytes.decode()` does not. Everything downstream compares this text against the
+    `new_str` an agent supplied, which is `\\n`-only -- so on a CRLF file the pair
+    differed on EVERY line, the patch became one whole-file hunk, and a genuine no-op
+    looked like a full rewrite.
+
+    Not a Windows-only concern, which is why this runs everywhere: a CRLF file checked
+    out on any host reaches the same reader. Windows CI is merely where it is
+    unmissable, because that is where writing a file produces CRLF by default.
+    """
+    p = tmp_path / "crlf.ts"
+    p.write_bytes(b"line1\r\nline2\r\n")
+    assert cr._safe_read_snapshot_raw(str(p)) == "line1\nline2\n"
+
+    # A lone CR (classic-Mac style, and what a truncated CRLF write leaves) folds too.
+    q = tmp_path / "cr.ts"
+    q.write_bytes(b"a\rb")
+    assert cr._safe_read_snapshot_raw(str(q)) == "a\nb"
+
+    # The payoff: a CRLF file whose content did not change must still read as a no-op
+    # rather than as a rewrite of every line.
+    before = cr._safe_read_snapshot_raw(str(p))
+    p.write_bytes(b"line1\r\nline2\r\n")
+    assert cr._safe_read_snapshot_raw(str(p)) == before
+
+
+def test_the_snapshot_read_goes_through_the_symlink_safe_chokepoint(tmp_path, monkeypatch):
+    """`validate_file_path` then a plain read is a TOCTOU, and the sibling closes it.
+
+    Between validating a path and reading it, an agent can swap the file for a link
+    pointing outside the validated tree; a plain read follows it and the target's
+    bytes land in message metadata. The hooks bytes reader opens with `O_NOFOLLOW`
+    and then `fstat()`s the DESCRIPTOR, so the inode validated is the inode read --
+    which also rejects a hardlinked inode, something `O_NOFOLLOW` alone does not.
 
     Asserted by routing rather than by winning a race: the chokepoint is replaced,
     and the reader must be the thing that notices. A reverting mutation back to
-    `read_text` bypasses the replacement and the file is read anyway.
+    `Path.read_text` bypasses the replacement and the file is read anyway.
     """
     p = tmp_path / "a.ts"
     p.write_text("hello\n", encoding="utf-8")
@@ -196,13 +225,13 @@ def test_the_snapshot_read_goes_through_the_symlink_safe_chokepoint(tmp_path, mo
 
     calls: list[str] = []
 
-    def _refuse(path: str) -> str:
+    def _refuse(path: str, *args, **kwargs):
         calls.append(path)
-        raise PermissionError("symlink target outside the validated path")
+        raise PermissionError("link target outside the validated path")
 
-    monkeypatch.setattr(cr, "safe_read_file", _refuse)
+    monkeypatch.setattr(cr, "safe_read_file_bytes_nolink", _refuse)
     assert cr._safe_read_snapshot_raw(str(p)) is None
-    assert calls == [str(p)], "the read must go through safe_read_file, not read_text"
+    assert calls == [str(p)], "the read must go through the hooks chokepoint"
 
 
 def test_an_oversized_body_is_not_read_or_diffed(tmp_path):
@@ -210,17 +239,9 @@ def test_an_oversized_body_is_not_read_or_diffed(tmp_path):
 
     It exists to feed a full-body diff, so an agent can hand it a file of any size
     and both the read and difflib's pass over the result run on the turn coroutine.
-    Bounded at the same ceiling the sibling reader uses, and re-checked after the
-    read because `stat()` races a writer still growing the file.
-
-    MUTATION NOTE: the two bounds MASK each other here. Removing the `stat()` gate
-    alone leaves the post-read check to catch it, and removing the post-read check
-    alone leaves the gate -- so neither mutation reddens this test on its own, and
-    only removing BOTH does. That is the defence-in-depth the sibling reader also
-    carries, and it is recorded rather than papered over: the case that separates
-    them is a file that stats small and reads large (the sibling's comment names
-    /dev/zero and FIFOs), which cannot be exercised here because reading a FIFO
-    would block the test.
+    The ceiling is passed to the reader itself as `max_bytes`, so the bytes are
+    never materialised in the first place -- the same ceiling the sibling reader
+    `_reconstruct_str_replace_before` uses.
     """
     p = tmp_path / "huge.bin"
     p.write_text("y" * (cr._MAX_RECONSTRUCT_BYTES + 1_000), encoding="utf-8")

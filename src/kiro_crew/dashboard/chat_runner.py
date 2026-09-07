@@ -1377,28 +1377,44 @@ def _safe_read_snapshot_raw(path: str) -> str | None:
         p = Path(validated)
         if not p.is_file():
             return None
-        # BOUND the read before it happens. This reader exists to feed a full-body
-        # diff, so it is the one snapshot path that is NOT capped by
-        # _MAX_SNAPSHOT — and an agent can write a file of any size. Without a
-        # ceiling the read and the difflib pass below it are both unbounded on the
-        # turn coroutine. Same ceiling and the same double-check as
-        # _reconstruct_str_replace_before: stat() races a writer still growing the
-        # file, so the length is re-checked after the read as well.
-        st = p.stat()
-        if not stat_module.S_ISREG(st.st_mode) or st.st_size > _MAX_RECONSTRUCT_BYTES:
+        # BOUND the read, and read it symlink-safely, in one call.
+        #
+        # This is the one snapshot path deliberately NOT capped by _MAX_SNAPSHOT --
+        # it exists to feed a full-body diff -- so without a ceiling both the read
+        # and difflib's pass over the result are unbounded on the turn coroutine,
+        # and an agent can write a file of any size. `max_bytes` applies the same
+        # ceiling _reconstruct_str_replace_before uses.
+        #
+        # Read through the hooks chokepoint rather than Path.read_text for the
+        # reason that sibling already documents: validate_file_path checks a path
+        # and a plain read opens one, and between the two an agent can swap the
+        # validated file for a link pointing outside it. The `_nolink` reader opens
+        # with O_NOFOLLOW and then fstat()s the DESCRIPTOR, so the inode validated
+        # is the inode read -- it rejects a hardlinked inode too, which O_NOFOLLOW
+        # alone does not (AWS-33/AWS-62).
+        #
+        # Bytes rather than text, and decoded here, because the text chokepoint
+        # opens with encoding="utf-8" and no error handler: an agent-written file
+        # holding one undecodable byte would raise, the except below would swallow
+        # it, and the row would silently show nothing. Git and agent-authored files
+        # are UTF-8 whatever the host's preferred code page says -- which matters on
+        # Windows, where a legacy default like cp1252 would mangle them -- and
+        # `errors="replace"` keeps binary garbage readable instead of fatal.
+        raw = safe_read_file_bytes_nolink(path, max_bytes=_MAX_RECONSTRUCT_BYTES)
+        if raw is None:
             return None
-        # Read through hooks.safe_read_file rather than Path.read_text, for the
-        # reason the sibling reader already documents: validate_file_path checks a
-        # path and this reads one, and between the two an agent can swap the
-        # validated file for a symlink pointing outside it. safe_read_file
-        # re-checks the RESOLVED target and opens with O_NOFOLLOW, closing that
-        # window (AWS-33/AWS-62). It also handles the encoding concern that the
-        # old call spelled out by hand: Git and agent-authored files are UTF-8
-        # whatever the host's preferred code page says, which matters on Windows.
-        content = safe_read_file(path)
-        if len(content) > _MAX_RECONSTRUCT_BYTES:
-            return None
-        return content
+        text = raw.decode("utf-8", errors="replace")
+        # Translate line endings the way the text-mode read this replaced did.
+        #
+        # Reading BYTES buys the lenient decode, and costs Python's universal-newline
+        # translation: a text-mode open (newline=None) folds \r\n and lone \r to \n,
+        # and a decode does not. Every consumer downstream compares this against the
+        # `new_str` an agent supplied -- which is \n-only -- so on a CRLF file the
+        # before/after pair differed on every single line, the patch was one whole-file
+        # hunk, and a genuine no-op looked like a rewrite. Windows CI is where this
+        # shows up unmissably, but it is not Windows-specific: a CRLF file checked out
+        # on any host hits it.
+        return text.replace("\r\n", "\n").replace("\r", "\n")
     except Exception:
         return None
 
