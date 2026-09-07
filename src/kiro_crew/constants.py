@@ -161,8 +161,39 @@ SUBAGENT_TIMEOUT_MAX = 86400
 MARKER_CLOSERS = "]\u3011\uff3d\u3015"
 _MARKER_CLOSE_CLASS = "[" + re.escape(MARKER_CLOSERS) + "]"
 
+#: Markdown WRAPPER characters tolerated around a complete marker line (#9110).
+#: A model sometimes wraps the whole marker in inline code or emphasis --
+#: ``\`[OPTIONS: A | B]\``` or ``**[OPTIONS: A | B]**``. The wrapper character
+#: lands AFTER the closer, breaks the end anchor, and the marker leaks into the
+#: visible message as literal text while the turn silently loses its pills --
+#: the same class of model tic as the stray ``](OPTIONS)`` suffix the grammar
+#: already absorbs. Scope is deliberately tight so real prose never matches:
+#: a LEADING wrapper is accepted only at line start (after optional indent), so
+#: emphasis belonging to preceding prose (``**Choose:** [OPTIONS: ...]``) is
+#: never eaten, and a TRAILING wrapper only when it abuts the closer (or its
+#: ``(...)`` tic) AND the marker itself is line-anchored -- spelled as a
+#: conditional on the ``lwrap`` group, which participates (possibly empty) at
+#: line start and cannot participate mid-line. A MID-LINE marker keeps the
+#: pre-widening grammar exactly: without the condition, the trailing run eats
+#: the closing character of a surrounding inline span (``\`Use [OPTIONS: A |
+#: B]\```), corrupting the visible prose and emitting bogus buttons. Runs are
+#: capped at 3 (``***`` is the longest CommonMark emphasis run; 4+ is not a
+#: wrapper).
+#:
+#: ReDoS profile unchanged: the class shares no character with the trailing
+#: ``[ \t]*`` / ``\s*`` or the indent class, and both wrapper positions are
+#: anchored by the required ``[OPTIONS:`` literal, so no new ambiguity exists.
+MARKER_WRAPPERS = "`*_"
+_MARKER_WRAP_CLASS = "[" + re.escape(MARKER_WRAPPERS) + "]"
+
+# The ``labels`` group is NAMED because the ``lwrap`` conditional group
+# necessarily precedes it, shifting positional numbering: consumers read
+# ``group("labels")`` (and iterate with ``finditer``, since ``findall`` on a
+# multi-group pattern yields tuples).
 OPTIONS_RE_LINE = re.compile(
-    rf"\[OPTIONS:((?:[^[\n]|\[(?!OPTIONS:))*){_MARKER_CLOSE_CLASS}(?:\([^\s()]*\))?[ \t]*$",
+    rf"(?P<lwrap>^[ \t]*{_MARKER_WRAP_CLASS}{{0,3}})?"
+    rf"\[OPTIONS:(?P<labels>(?:[^[\n]|\[(?!OPTIONS:))*){_MARKER_CLOSE_CLASS}"
+    rf"(?:\([^\s()]*\))?(?(lwrap){_MARKER_WRAP_CLASS}{{0,3}})[ \t]*$",
     re.MULTILINE,
 )
 
@@ -173,9 +204,14 @@ OPTIONS_RE_LINE = re.compile(
 # the same optional markdown-link close as LINE (same ``[^\s()]`` inner class, so it
 # shares no character with the trailing ``\s*`` — ReDoS-safe) so the grammar stays
 # identical.
+# ``re.MULTILINE`` is added ONLY so the optional leading-wrapper group can
+# anchor ``^`` at the marker's own line start; the pattern has no ``$`` and
+# ``\Z`` is unaffected by the flag, so nothing else changes.
 OPTIONS_RE_TRAILER = re.compile(
-    rf"\[OPTIONS:((?:[^[]|\[(?!OPTIONS:))*){_MARKER_CLOSE_CLASS}(?:\([^\s()]*\))?\s*\Z",
-    re.DOTALL,
+    rf"(?P<lwrap>^[ \t]*{_MARKER_WRAP_CLASS}{{0,3}})?"
+    rf"\[OPTIONS:(?P<labels>(?:[^[]|\[(?!OPTIONS:))*){_MARKER_CLOSE_CLASS}"
+    rf"(?:\([^\s()]*\))?(?(lwrap){_MARKER_WRAP_CLASS}{{0,3}})\s*\Z",
+    re.DOTALL | re.MULTILINE,
 )
 
 # CONTROL-TAG HTML COMMENTS — canonical grammar (single source of truth).
@@ -365,6 +401,28 @@ def _rightmost_unfinished_marker(text: str) -> int:
     return -1
 
 
+def _leading_wrapper_start(text: str, idx: int) -> int:
+    """Start of a line-leading Markdown wrapper run abutting *idx*, else *idx*.
+
+    Mirrors the regexes' optional leading-wrapper group (see
+    :data:`MARKER_WRAPPERS`) for the STILL-STREAMING path: a wrapped marker's
+    head is located at its ``[``, and without this the leading wrapper stays in
+    the visible half, where a length rotation can split it from the marker it
+    belongs to. The run must abut *idx*, be at most 3 characters, and carry
+    only indent before it on its line -- a mid-line wrapper belongs to prose
+    (the completed regex leaves it visible too) and a 4+ run is not a wrapper.
+    """
+    run = idx
+    while run > 0 and idx - run < 3 and text[run - 1] in MARKER_WRAPPERS:
+        run -= 1
+    if run == idx:
+        return idx
+    line_start = text.rfind("\n", 0, run) + 1
+    if text[line_start:run].strip(" \t") == "":
+        return run
+    return idx
+
+
 def split_trailing_protocol_suffix(text: str) -> tuple[str, str]:
     """Detach protocol trailers before a renderer length-splits ``text``.
 
@@ -394,7 +452,7 @@ def split_trailing_protocol_suffix(text: str) -> tuple[str, str]:
     # already yield the same split for a complete tail) and reintroduces that
     # bug.
     if idx != -1:
-        suffix_start = idx
+        suffix_start = _leading_wrapper_start(text, idx)
 
     options = OPTIONS_RE_TRAILER.search(text[:suffix_start])
     if options:

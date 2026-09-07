@@ -461,7 +461,7 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
     """
     match = OPTIONS_RE_TRAILER.search(text)
     if match:
-        choices = [c.strip() for c in match.group(1).split("|") if c.strip()]
+        choices = [c.strip() for c in match.group("labels").split("|") if c.strip()]
         return text[: match.start()].rstrip(), choices
     if hide_partial:
         idx = text.rfind("[OPTIONS")
