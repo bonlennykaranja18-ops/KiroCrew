@@ -41,6 +41,7 @@ from kiro_crew.acp._dispatch import reject_option_id as _reject_option_id
 from kiro_crew.acp._dispatch import (
     set_mode_params,
 )
+from kiro_crew.acp._frame_record import record_frame
 from kiro_crew.acp.client import (
     OversizeLineUnrecoverable,
     _drain_oversize_line,
@@ -2078,6 +2079,15 @@ class AcpRuntime:
                 if not isinstance(data, dict):
                     logger.debug("non-object JSON stdout line: %s", line[:200])
                     continue
+
+                # Opt-in raw-frame recording for the replay corpus. A no-op
+                # unless KIROCREW_ACP_RECORD_FRAMES names a directory: it
+                # returns before awaiting anything, so an ordinary run pays one
+                # env lookup. When it IS set the write is offloaded to
+                # subprocess_executor() rather than run here, because a
+                # filesystem syscall on this loop stalls every multiplexed
+                # session. It never raises -- see kiro_crew.acp._frame_record.
+                await record_frame(self._acp_backend, data)
 
                 msg = JsonRpcMessage.from_dict(data)
 
