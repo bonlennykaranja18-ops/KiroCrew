@@ -45,7 +45,7 @@ const {
   isPortInUse,
 } = require("./gateway-wait");
 const { describeSandboxProfileNeed } = require("./sandbox-profile");
-const { createLivenessMonitor } = require("./gateway-liveness");
+const { createLivenessMonitor, createBackendProbe } = require("./gateway-liveness");
 const {
   chooseRecoveryStrategy,
   classifyAdoptedGateway,
@@ -1260,7 +1260,9 @@ function createGatewaySupervisor({
       livenessMonitor = null;
     }
     livenessMonitor = createLivenessMonitor({
-      probe: () => checkBackend(HEALTH_URL),
+      // Not checkBackend(): that is the boot poll's 2s probe. The post-handoff
+      // probe has its own, wider budget — see LIVENESS_PROBE_TIMEOUT_MS.
+      probe: createBackendProbe({ httpMod: http, url: HEALTH_URL }),
       isWindowAlive: () => !!window && !window.isDestroyed(),
       onUnresponsive: () => {
         if (livenessMonitor) {
